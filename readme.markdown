@@ -11,6 +11,8 @@ Contained are several category methods
 - NSString+DTPaths - working with paths
 - NSURL+DTPrefLinks - getting direct-access URLs for preferences
 - NSURL+DTAppLinks - getting direct-access URLs for an app's app store and review page
+- UIImage+DTFoundation - helpful methods for drawing images
+- UIView+DTFoundation - helpful methods for working with views
 
 Other classes simplify working with specialized data
 
