@@ -72,12 +72,22 @@
 /**
  Returns the URL that is being downloaded by the receiver.
  */
-@property (nonatomic, strong, readonly) NSURL *url;
+@property (nonatomic, strong, readonly) NSURL *URL;
 
 /**
  Returns the entity tag of the downloading file.
  */
 @property (nonatomic, strong, readonly) NSString *downloadEntityTag;
+
+/**
+ Returns the MIME type of the downloading file.
+ */
+@property (nonatomic, strong, readonly) NSString *MIMEType;
+
+/**
+ Returns the MIME type of the downloading file.
+ */
+@property (nonatomic, assign, readonly) long long totalBytes;
 
 /**
  Returns the last modified date of the downloading file.
@@ -137,5 +147,7 @@
  Cancels a download in progress
  */
 - (void)cancel;
+
+- (BOOL)isLoading;
 
 @end

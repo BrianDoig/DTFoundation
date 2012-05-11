@@ -21,7 +21,7 @@
 
 @implementation DTDownload
 {
-	NSURL *_url;
+	NSURL *_URL;
 	NSString *internalDownloadFolder;
 	NSString *downloadEntityTag;
 	NSDate *lastModifiedDate;
@@ -37,7 +37,9 @@
 	float previousSpeed;
 	
 	long long receivedBytes;
-	long long totalBytes;
+	long long _totalBytes;
+	
+	NSString *_contentType;
 	
 	
 	NSString *receivedDataFilePath;
@@ -46,19 +48,18 @@
 	__unsafe_unretained id <DTDownloadDelegate> delegate;
 	
 	BOOL headOnly;
+	
+	BOOL _isLoading;
 }
-
-@synthesize url = _url, internalDownloadFolder, downloadEntityTag, folderForDownloading, lastPaketTimestamp, delegate, lastModifiedDate;
-@synthesize context;
 
 #pragma mark Downloading
 
-- (id)initWithURL:(NSURL *)url
+- (id)initWithURL:(NSURL *)URL
 {
 	self = [super init];
 	if (self)
 	{
-		_url = url;
+		_URL = URL;
 		
 		[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appWillTerminate:) name:UIApplicationWillTerminateNotification object:nil];
 	}
@@ -71,7 +72,7 @@
 	[[NSNotificationCenter defaultCenter] removeObserver:self];
 	
 	
-	if (!headOnly && receivedBytes < totalBytes)
+	if (!headOnly && receivedBytes < _totalBytes)
 	{
 		// update resume info on disk
 		[self _updateDownloadInfo];
@@ -80,7 +81,7 @@
 
 - (void)startHEAD
 {
-	NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:_url
+	NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:_URL
 														 cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
 													 timeoutInterval:60.0];
 	[request setHTTPMethod:@"HEAD"];
@@ -94,7 +95,9 @@
 
 - (void)startWithResume:(BOOL)shouldResume
 {
-	NSString *fileName = [[_url path] lastPathComponent];
+	_isLoading = YES;
+	
+	NSString *fileName = [[_URL absoluteString] md5Checksum];
 	self.internalDownloadFolder = [[self.folderForDownloading stringByAppendingPathComponent:fileName] stringByAppendingPathExtension:@"download"];
 	
 	receivedDataFilePath = [internalDownloadFolder stringByAppendingPathComponent:fileName];
@@ -109,7 +112,7 @@
 		NSDictionary *infoDictionary = [NSDictionary dictionaryWithContentsOfFile:infoPath];
 		NSDictionary *resumeInfo = [infoDictionary objectForKey:@"DownloadEntryResumeInformation"];
 		
-		totalBytes = [[infoDictionary objectForKey:@"DownloadEntryProgressTotalToLoad"] longLongValue];
+		_totalBytes = [[infoDictionary objectForKey:@"DownloadEntryProgressTotalToLoad"] longLongValue];
 		receivedBytes = [[resumeInfo objectForKey:@"NSURLDownloadBytesReceived"] longLongValue];
 		downloadEntryIdentifier = [infoDictionary objectForKey:@"DownloadEntryIdentifier"];
 		if (!downloadEntryIdentifier)
@@ -148,7 +151,7 @@
 			{
 				// inconsistency, reset
 				receivedBytes = 0;
-				totalBytes = 0;
+				_totalBytes = 0;
 				downloadEntityTag = nil;
 				lastModifiedDate = nil;
 				
@@ -165,7 +168,7 @@
 			}
 			else 
 			{
-				if (receivedBytes && receivedBytes == totalBytes)
+				if (receivedBytes && receivedBytes == _totalBytes)
 				{
 					NSLog(@"Already done!");
 					
@@ -191,14 +194,14 @@
 	
 	
 	
-	NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:_url
+	NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:_URL
 														 cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
 													 timeoutInterval:60.0];
 	
 	// set range header
 	if (receivedBytes)
 	{
-		[request setValue:[NSString stringWithFormat:@"bytes=%d-", receivedBytes] forHTTPHeaderField:@"Range"];
+		[request setValue:[NSString stringWithFormat:@"bytes=%lld-", receivedBytes] forHTTPHeaderField:@"Range"];
 	}
 	
 	// start downloading
@@ -214,7 +217,7 @@
 {
 	self.delegate = nil;
 	
-	if (receivedBytes < totalBytes)
+	if (receivedBytes < _totalBytes)
 	{
 		// update resume info on disk
 		[self _updateDownloadInfo];
@@ -224,6 +227,8 @@
 	
 	receivedData = nil;
 	urlConnection = nil;
+	
+	_isLoading = NO;
 }
 
 - (void)_completeDownload
@@ -232,7 +237,7 @@
 	
 	NSFileManager *fm = [NSFileManager defaultManager];
 	
-	NSString *fileName = [[_url path] lastPathComponent];
+	NSString *fileName = [[_URL path] lastPathComponent];
 	NSString *targetPath = [self.folderForDownloading stringByAppendingPathComponent:fileName];
 	
 	if ([fm fileExistsAtPath:targetPath])
@@ -276,7 +281,7 @@
 		[resumeDict setObject:downloadEntityTag forKey:@"NSURLDownloadEntityTag"];
 	}
 	
-	[resumeDict setObject:[_url description] forKey:@"DownloadEntryURL"];
+	[resumeDict setObject:[_URL description] forKey:@"DownloadEntryURL"];
 	
 	NSDictionary *writeDict = [NSDictionary dictionaryWithObjectsAndKeys:
 							   [NSNumber numberWithInt:-999], @"DownloadEntryErrorCodeDictionaryKey",
@@ -285,9 +290,9 @@
 							   downloadEntryIdentifier, @"DownloadEntryIdentifier",
 							   receivedDataFilePath, @"DownloadEntryPath",
 							   [NSNumber numberWithLongLong:receivedBytes], @"DownloadEntryProgressBytesSoFar",
-							   [NSNumber numberWithLongLong:totalBytes], @"DownloadEntryProgressTotalToLoad",
+							   [NSNumber numberWithLongLong:_totalBytes], @"DownloadEntryProgressTotalToLoad",
 							   resumeDict, @"DownloadEntryResumeInformation",
-							   [_url description], @"DownloadEntryURL"
+							   [_URL description], @"DownloadEntryURL"
 							   , nil];
 	
 	NSString *infoPath = [internalDownloadFolder stringByAppendingPathComponent:@"Info.plist"];
@@ -310,6 +315,8 @@
 	{
 		[delegate download:self didFailWithError:error];
 	}
+	
+	_isLoading = NO;
 }
 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response
@@ -317,8 +324,7 @@
 	if ([response isKindOfClass:[NSHTTPURLResponse class]])
 	{
 		NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-		//NSString* contentType = [http.allHeaderFields objectForKey:@"Content-Type"];
-		
+		_MIMEType = http.MIMEType;
 		
 		if (http.statusCode>=400)
 		{
@@ -332,9 +338,9 @@
 			return;
 		}
 		
-		if (totalBytes<=0)
+		if (_totalBytes<=0)
 		{
-			totalBytes = [response expectedContentLength];
+			_totalBytes = [response expectedContentLength];
 		}
 		
 		NSString * currentEntityTag = [http.allHeaderFields objectForKey:@"Etag"];
@@ -413,7 +419,7 @@
 	// notify delegate
 	if ([delegate respondsToSelector:@selector(download:downloadedBytes:ofTotalBytes:withSpeed:)])
 	{
-		[delegate download:self downloadedBytes:receivedBytes ofTotalBytes:totalBytes withSpeed:downloadSpeed];
+		[delegate download:self downloadedBytes:receivedBytes ofTotalBytes:_totalBytes withSpeed:downloadSpeed];
 	}
 }
 
@@ -436,6 +442,14 @@
 	{
 		[self _completeDownload];
 	}
+	
+	_isLoading = NO;
+}
+
+#pragma mark Notifications
+- (void)appWillTerminate:(NSNotification *)notification
+{
+	[self cancel];
 }
 
 #pragma mark Properties
@@ -449,10 +463,15 @@
 	return folderForDownloading;
 }
 
-#pragma mark Notifications
-- (void)appWillTerminate:(NSNotification *)notification
+- (BOOL)isLoading
 {
-	[self cancel];
+	return _isLoading;
 }
+
+@synthesize URL = _URL, internalDownloadFolder, downloadEntityTag, folderForDownloading, lastPaketTimestamp, delegate, lastModifiedDate;
+@synthesize MIMEType = _MIMEType;
+@synthesize totalBytes = _totalBytes;
+@synthesize context;
+
 
 @end
