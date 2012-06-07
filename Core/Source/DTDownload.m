@@ -9,6 +9,10 @@
 #import "DTDownload.h"
 #import "NSString+DTUtilities.h"
 
+NSString * const DTDownloadDidStartNotification = @"DTDownloadDidStartNotification";
+NSString * const DTDownloadDidFinishNotification = @"DTDownloadDidFinishNotification";
+NSString * const DTDownloadProgressNotification = @"DTDownloadProgressNotification";
+
 @interface DTDownload ()
 
 @property (nonatomic, retain) NSString *internalDownloadFolder;
@@ -50,6 +54,10 @@
 	BOOL headOnly;
 	
 	BOOL _isLoading;
+	BOOL _cancelled;
+	
+	// response handlers
+	DTDownloadResponseHandler _responseHandler;
 }
 
 #pragma mark Downloading
@@ -87,7 +95,11 @@
 	[request setHTTPMethod:@"HEAD"];
 	
 	// start downloading
-	urlConnection=[[NSURLConnection alloc] initWithRequest:request delegate:self];
+	urlConnection = [[NSURLConnection alloc] initWithRequest:request delegate:self startImmediately:NO];
+	
+	// without this special it would get paused during scrolling of scroll views
+	[urlConnection scheduleInRunLoop:[NSRunLoop mainRunLoop] forMode: NSRunLoopCommonModes];
+	[urlConnection start];
 	
 	// getting only a HEAD
 	headOnly = YES;
@@ -95,9 +107,19 @@
 
 - (void)startWithResume:(BOOL)shouldResume
 {
+	if (_isLoading)
+	{
+		return;
+	}
+	
+	if (_cancelled)
+	{
+		_cancelled = NO;
+	}
+	
 	_isLoading = YES;
 	
-	NSString *fileName = [[_URL absoluteString] md5Checksum];
+	NSString *fileName = [[_URL path] lastPathComponent];
 	self.internalDownloadFolder = [[self.folderForDownloading stringByAppendingPathComponent:fileName] stringByAppendingPathExtension:@"download"];
 	
 	receivedDataFilePath = [internalDownloadFolder stringByAppendingPathComponent:fileName];
@@ -120,9 +142,6 @@
 			downloadEntryIdentifier = [NSString stringWithUUID];
 		}
 		
-		downloadEntityTag = [resumeInfo objectForKey:@"NSURLDownloadEntityTag"];
-		
-		
 		if ([delegate respondsToSelector:@selector(shouldResumeDownload:)])
 		{
 			if (!shouldResume || ![delegate shouldResumeDownload:self])
@@ -140,6 +159,9 @@
 		
 		if (shouldResume)
 		{
+			downloadEntityTag = [resumeInfo objectForKey:@"NSURLDownloadEntityTag"];
+
+			
 			// here we assume we should continue download
 			receivedDataFile = [NSFileHandle fileHandleForWritingAtPath:receivedDataFilePath];
 			[receivedDataFile seekToEndOfFile];
@@ -170,12 +192,19 @@
 			{
 				if (receivedBytes && receivedBytes == _totalBytes)
 				{
-					NSLog(@"Already done!");
-					
+					// Already done!
 					[self _completeDownload];
 					return;
 				}
 			}
+		}
+		else 
+		{
+			// reset
+			receivedBytes = 0;
+			_totalBytes = 0;
+			downloadEntityTag = nil;
+			lastModifiedDate = nil;
 		}
 	}
 	else 
@@ -183,7 +212,7 @@
 		// create download folder
 		NSError *error = nil;
 		
-		if (![[NSFileManager defaultManager] createDirectoryAtPath:internalDownloadFolder withIntermediateDirectories:NO attributes:nil error:&error])
+		if (![[NSFileManager defaultManager] createDirectoryAtPath:internalDownloadFolder withIntermediateDirectories:YES attributes:nil error:&error])
 		{
 			NSLog(@"Cannot create download folder %@, %@", internalDownloadFolder, [error localizedDescription]);
 			return;
@@ -191,8 +220,6 @@
 		
 		downloadEntryIdentifier = [NSString stringWithUUID];
 	}
-	
-	
 	
 	NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:_URL
 														 cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
@@ -204,8 +231,15 @@
 		[request setValue:[NSString stringWithFormat:@"bytes=%lld-", receivedBytes] forHTTPHeaderField:@"Range"];
 	}
 	
+	// send notification
+	[[NSNotificationCenter defaultCenter] postNotificationName:DTDownloadDidStartNotification object:self];
+	
 	// start downloading
-	urlConnection=[[NSURLConnection alloc] initWithRequest:request delegate:self];
+	urlConnection = [[NSURLConnection alloc] initWithRequest:request delegate:self startImmediately:NO];
+
+	// without this special it would get paused during scrolling of scroll views
+	[urlConnection scheduleInRunLoop:[NSRunLoop mainRunLoop] forMode: NSRunLoopCommonModes];
+	[urlConnection start];
 	
 	if (urlConnection) 
 	{
@@ -215,6 +249,7 @@
 
 - (void)cancel
 {
+	_cancelled = YES;
 	self.delegate = nil;
 	
 	if (receivedBytes < _totalBytes)
@@ -229,6 +264,9 @@
 	urlConnection = nil;
 	
 	_isLoading = NO;
+	
+	// send notification
+	[[NSNotificationCenter defaultCenter] postNotificationName:DTDownloadDidFinishNotification object:self];
 }
 
 - (void)_completeDownload
@@ -267,6 +305,11 @@
 	if ([delegate respondsToSelector:@selector(download:didFinishWithFile:)])
 	{
 		[delegate download:self didFinishWithFile:targetPath];
+	}
+	
+	if (_completionHandler)
+	{
+		_completionHandler(self);
 	}
 }
 
@@ -317,6 +360,9 @@
 	}
 	
 	_isLoading = NO;
+	
+	// send notification
+	[[NSNotificationCenter defaultCenter] postNotificationName:DTDownloadDidFinishNotification object:self];
 }
 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response
@@ -355,11 +401,12 @@
 			{
 				// file was changed on server restart from beginning
 				[urlConnection cancel];
+                
+                // update loading flag to allow resume
+                _isLoading = NO;
 				[self startWithResume:NO];
 			}
 		}
-		
-		
 		
 		// get something to identify file
 		NSString *modified = [http.allHeaderFields objectForKey:@"Last-Modified"];
@@ -373,6 +420,10 @@
 			lastModifiedDate = [dateFormatter dateFromString:modified];
 		}
 		
+		if (_responseHandler)
+		{
+			_responseHandler(self, [http allHeaderFields]);
+		}
 	}
 	else 
 	{
@@ -415,21 +466,29 @@
 	
 	self.lastPaketTimestamp = now;
 	
-	
 	// notify delegate
 	if ([delegate respondsToSelector:@selector(download:downloadedBytes:ofTotalBytes:withSpeed:)])
 	{
 		[delegate download:self downloadedBytes:receivedBytes ofTotalBytes:_totalBytes withSpeed:downloadSpeed];
 	}
+	
+	// send notification
+	if (_totalBytes)
+	{
+		NSDictionary *userInfo = [NSDictionary dictionaryWithObject:[NSNumber numberWithFloat:(float)receivedBytes / (float)_totalBytes] forKey:@"ProgressPercent"];
+		[[NSNotificationCenter defaultCenter] postNotificationName:DTDownloadProgressNotification object:self userInfo:userInfo];
+	}
 }
-
 
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection
 {
 	receivedData = nil;
 	urlConnection = nil;
-	
+
+	_isLoading = NO;
+
 	[receivedDataFile closeFile];
+	receivedDataFile = nil;
 	
 	if (headOnly)
 	{
@@ -443,7 +502,8 @@
 		[self _completeDownload];
 	}
 	
-	_isLoading = NO;
+	// send notification
+	[[NSNotificationCenter defaultCenter] postNotificationName:DTDownloadDidFinishNotification object:self];
 }
 
 #pragma mark Notifications
@@ -457,7 +517,9 @@
 {
 	if (!folderForDownloading)
 	{
-		self.folderForDownloading = NSTemporaryDirectory();
+		NSString *md5 = [[_URL absoluteString] md5Checksum];
+		
+		self.folderForDownloading = [NSTemporaryDirectory() stringByAppendingPathComponent:md5];
 	}
 	
 	return folderForDownloading;
@@ -472,6 +534,8 @@
 @synthesize MIMEType = _MIMEType;
 @synthesize totalBytes = _totalBytes;
 @synthesize context;
+@synthesize responseHandler = _responseHandler;
+@synthesize completionHandler = _completionHandler;
 
 
 @end

@@ -15,6 +15,7 @@
 
 #import <ImageIO/CGImageSource.h>
 #import "NSString+DTFormatNumbers.h"
+#import "DTAsyncFileDeleter.h"
 
 NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFile";
 
@@ -44,6 +45,9 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	
 	NSUInteger _maxNumberOfConcurrentDownloads;
 	NSUInteger _diskCapacity;
+	
+	// completion handling
+	NSMutableDictionary *_completionHandlers;
 	
 	// maintenance
 	dispatch_queue_t _maintenanceQueue;
@@ -77,8 +81,10 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 		
 		_memoryCache = [[NSCache alloc] init];
 		
-		_maxNumberOfConcurrentDownloads = 5;
+		_maxNumberOfConcurrentDownloads = 1;
 		_diskCapacity = 1024*1024*20; // 20 MB
+		
+		_completionHandlers = [[NSMutableDictionary alloc] init];
 	}
 	
 	return self;
@@ -86,10 +92,50 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 
 #pragma mark Queue Handling
 
-- (void)_enqueueDownloadForURL:(NSURL *)URL
+- (void)_enqueueDownloadForURL:(NSURL *)URL option:(DTDownloadCacheOption)option
 {
 	DTDownload *download = [[DTDownload alloc] initWithURL:URL];
 	download.delegate = self;
+	
+	if (option == DTDownloadCacheOptionReturnCacheAndLoadIfChanged)
+	{
+		DTCachedFile *cachedFile = [self _cachedFileForURL:URL inContext:_managedObjectContext];
+		
+		if (cachedFile)
+		{
+			NSString *cachedETag = cachedFile.entityTagIdentifier;
+			NSDate *lastModifiedDate = cachedFile.lastModifiedDate;
+			
+			__weak DTDownloadCache *weakself = self;
+			
+			download.responseHandler = ^(DTDownload *download, NSDictionary *headers) {
+				BOOL shouldCancel = NO;
+				
+				if (cachedETag)
+				{
+					if ([download.downloadEntityTag isEqualToString:cachedETag])
+					{
+						shouldCancel = YES;
+					}
+				}
+				
+				if (lastModifiedDate)
+				{
+					if ([download.lastModifiedDate isEqualToDate:lastModifiedDate])
+					{
+						shouldCancel = YES;
+					}
+				}
+				
+				if (shouldCancel)
+				{
+					[download cancel];
+					[weakself _removeDownloadFromQueue:download];
+				}
+			};
+		}
+	}
+		
 	
 	[_downloads setObject:download forKey:URL];
 	[_downloadQueue addObject:download];
@@ -100,6 +146,14 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	[_activeDownloads removeObject:download];
 	[_downloads removeObjectForKey:download.URL];
 	[_downloadQueue removeObject:download];
+	
+	// remove a handler if it exists
+	DTDownloadCacheDataCompletionBlock completion = [_completionHandlers objectForKey:download.URL];
+	
+	if (completion)
+	{
+		[_completionHandlers removeObjectForKey:download.URL];
+	}
 }
 
 - (void)_startNextQueuedDownload
@@ -115,17 +169,48 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 				[_activeDownloads addObject:nextDownload];
 				[nextDownload startWithResume:YES];
 			}
-			
+
 			numberLoading++;
 		}
 	}
+}
+
+- (void)_cancelDownloadsOverConcurrencyLimit
+{
+	NSUInteger numberLoading = 0;
+	
+	for (DTDownload *nextDownload in [_downloadQueue reverseObjectEnumerator]) 
+	{
+		if ([nextDownload isLoading])
+		{
+			numberLoading++;
+
+			if (numberLoading<=_maxNumberOfConcurrentDownloads)
+			{
+				// leave it be
+			}
+			else 
+			{
+				// cancel
+				[nextDownload cancel];
+				
+				[_activeDownloads removeObject:nextDownload];
+				
+				// cancel ditches the delegate, lets restore that
+				nextDownload.delegate = self;
+			}
+
+		}
+	}
+	
+	NSLog(@"Loading Downloads: %d", numberLoading);
 }
 
 
 #pragma mark External Methods
 
 
-- (NSData *)cachedDataForURL:(NSURL *)URL shouldLoad:(BOOL)shouldLoad
+- (NSData *)cachedDataForURL:(NSURL *)URL option:(DTDownloadCacheOption)option
 {
 	// TODO: make this thread-safe so it can be called from background threads
 	if (dispatch_get_current_queue() != dispatch_get_main_queue())
@@ -133,25 +218,40 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 		__block NSData *retData;
 		
 		dispatch_sync(dispatch_get_main_queue(), ^{
-			retData = [self cachedDataForURL:URL shouldLoad:shouldLoad];
+			retData = [self cachedDataForURL:URL option:option];
 		});
 		
 		return retData;
 	}
 	
+	NSData *retData = nil;
+	
 	DTCachedFile *existingCacheEntry = [self _cachedFileForURL:URL inContext:_managedObjectContext];
 	
 	if (existingCacheEntry)
 	{
-		existingCacheEntry.lastAccessDate = [NSDate date];
+		retData = existingCacheEntry.fileData;
+
+		if (option == DTDownloadCacheOptionReturnCacheAndLoadAlways)
+		{
+			[_managedObjectContext deleteObject:existingCacheEntry];
+		}
+		else 
+		{
+			existingCacheEntry.lastAccessDate = [NSDate date];
+		}
+
 		[self _commitContext:_managedObjectContext];
-		
-		return existingCacheEntry.fileData;
+	}
+
+	if (option == DTDownloadCacheOptionNeverLoad)
+	{
+		return retData;
 	}
 	
-	if (!shouldLoad)
+	if (retData && option == DTDownloadCacheOptionLoadIfNotCached)
 	{
-		return nil;
+		return retData;
 	}
 	
 	// we don't have a cache entry, need to load
@@ -171,10 +271,10 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 		return nil;
 	}
 	
-	[self _enqueueDownloadForURL:URL];
+	[self _enqueueDownloadForURL:URL option:option];
 	[self _startNextQueuedDownload];
 	
-	return nil;
+	return retData;
 }
 
 - (NSUInteger)currentDiskUsage
@@ -187,7 +287,7 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 - (void)download:(DTDownload *)download didFailWithError:(NSError *)error
 {
 	[self _removeDownloadFromQueue:download];
-
+	
 	[self _startNextQueuedDownload];
 }
 
@@ -198,8 +298,16 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 		NSManagedObjectContext *tmpContext = [[NSManagedObjectContext alloc] init];
 		tmpContext.persistentStoreCoordinator = _persistentStoreCoordinator;
 		
-		DTCachedFile *cachedFile = (DTCachedFile *)[NSEntityDescription insertNewObjectForEntityForName:@"DTCachedFile" 
-																				 inManagedObjectContext:tmpContext];	
+		
+		// check if URL already exists
+		DTCachedFile *cachedFile = [self _cachedFileForURL:download.URL inContext:tmpContext];
+		
+		if (!cachedFile)
+		{
+			// create a new entity
+			cachedFile = (DTCachedFile *)[NSEntityDescription insertNewObjectForEntityForName:@"DTCachedFile" inManagedObjectContext:tmpContext];
+		}
+		
 		cachedFile.lastAccessDate = [NSDate date];
 		cachedFile.expirationDate = [NSDate distantFuture];
 		cachedFile.lastModifiedDate = download.lastModifiedDate;
@@ -213,7 +321,21 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 		[self _commitContext:tmpContext];
 		
 		dispatch_sync(dispatch_get_main_queue(), ^{
+			// execute completion block if there is one registered
+			DTDownloadCacheDataCompletionBlock completion = [_completionHandlers objectForKey:download.URL];
+			
+			if (completion)
+			{
+				completion(data);
+				
+				[_completionHandlers removeObjectForKey:download.URL];
+			}
+			
+			// send notification 
 			[[NSNotificationCenter defaultCenter] postNotificationName:DTDownloadCacheDidCacheFileNotification object:download.URL];
+			
+			// we transfered the file into the database, so we don't need it any more
+			[[DTAsyncFileDeleter sharedInstance] removeItemAtPath:path];
 		});
 	});
 	
@@ -368,8 +490,16 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 {
 	// ignore change notifications for the main MOC
 	
-	if (_managedObjectContext == [notification object])
+	NSManagedObjectContext *savedContext = [notification object];
+	
+	if (_managedObjectContext == savedContext)
 	{
+		return;
+	}
+	
+	if (_managedObjectContext.persistentStoreCoordinator != savedContext.persistentStoreCoordinator)
+	{
+		// that's another database
 		return;
 	}
 	
@@ -498,12 +628,34 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	});
 }
 
+#pragma mark Completion Blocks
+
+- (void)_registerCompletion:(DTDownloadCacheDataCompletionBlock)completion forURL:(NSURL *)URL
+{
+	[_completionHandlers setObject:[completion copy] forKey:URL];	
+}
+
 #pragma mark Properties
 
 - (void)setMaxNumberOfConcurrentDownloads:(NSUInteger)maxNumberOfConcurrentDownloads
 {
-	NSAssert(maxNumberOfConcurrentDownloads>0, @"maximum number of concurrent downloads cannot be zero");
-	_maxNumberOfConcurrentDownloads = maxNumberOfConcurrentDownloads;
+	if (_maxNumberOfConcurrentDownloads != maxNumberOfConcurrentDownloads)
+	{
+		BOOL needsTrim = (maxNumberOfConcurrentDownloads < _maxNumberOfConcurrentDownloads);
+		
+		NSAssert(maxNumberOfConcurrentDownloads>0, @"maximum number of concurrent downloads cannot be zero");
+		_maxNumberOfConcurrentDownloads = maxNumberOfConcurrentDownloads;
+	
+		NSLog(@"Concurrent Downloads set to %d", maxNumberOfConcurrentDownloads);
+		
+		// starts/stops enough downloads to match the max number
+		[self _startNextQueuedDownload];
+		
+		if (needsTrim)
+		{
+			[self _cancelDownloadsOverConcurrencyLimit];
+		}
+	}
 }
 
 - (void)setDiskCapacity:(NSUInteger)diskCapacity
@@ -527,7 +679,7 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 
 //TODO: make this thread-safe to be called from background threads
 
-- (UIImage *)cachedImageForURL:(NSURL *)URL shouldLoad:(BOOL)shouldLoad
+- (UIImage *)cachedImageForURL:(NSURL *)URL option:(DTDownloadCacheOption)option
 {
 	// try memory cache first
 	UIImage *cachedImage = [_memoryCache objectForKey:URL];
@@ -538,23 +690,12 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	}
 
 	// try file cache
-	NSData *data = [self cachedDataForURL:URL shouldLoad:shouldLoad];
+	NSData *data = [self cachedDataForURL:URL option:option];
 	
 	if (!data)
 	{
 		return nil;
 	}
-	
-//	// use ImageIO to make sure it stays cached
-//	NSDictionary *dict = [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:YES]
-//													 forKey:(id)kCGImageSourceShouldCache];
-//	
-//	CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
-//	CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, (__bridge CFDictionaryRef)dict);
-//	
-//	cachedImage = [UIImage imageWithCGImage:cgImage];
-//	CGImageRelease(cgImage);
-//	CFRelease(source);
 	
 	cachedImage = [UIImage imageWithData:data];
 	
@@ -570,5 +711,43 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	
 	return cachedImage;
 }
+
+- (UIImage *)cachedImageForURL:(NSURL *)URL option:(DTDownloadCacheOption)option completion:(DTDownloadCacheImageCompletionBlock)completion
+{
+	UIImage *cachedImage = [self cachedImageForURL:URL option:option];
+	
+	if (cachedImage)
+	{
+		return cachedImage;
+	}
+	
+	// register handler
+	if (completion)
+	{
+		DTDownloadCacheDataCompletionBlock internalBlock = ^(NSData *data)
+		{
+			// make an image out of the data
+			UIImage *cachedImage = [UIImage imageWithData:data];
+			
+			if (!cachedImage)
+			{
+				NSLog(@"Illegal Data cached for %@", URL);	
+				return;
+			}
+			
+			// put in memory cache
+			NSUInteger cost = (NSUInteger)(cachedImage.size.width * cachedImage.size.height);
+			[_memoryCache setObject:cachedImage forKey:URL cost:cost];
+			
+			// execute wrapped completion block
+			completion(cachedImage);
+		};
+		
+		[self _registerCompletion:internalBlock forURL:URL];
+	}
+	
+	return nil;
+}
+
 
 @end
